@@ -98,16 +98,29 @@ class AttentionModel(torch.nn.Module):
 
     def attention_net(self, lstm_output, final_state):
 
+        # final_state = [1, batch size, hidden dim]
+        # lstm_output = [batch size, sent len, hidden dim]
+
         hidden = final_state.squeeze(0)
         # print("Attention, hidden.size() = {}".format(hidden.size()))
         # hidden = [batch size, hidden dim]
 
         attn_weights = torch.bmm(lstm_output, hidden.unsqueeze(2)).squeeze(2)
+        # hidden.unsqueeze(2), hidden = [batch size, hidden dim, 1]
+        # [batch size, sent len, hidden dim] * [batch size, hidden dim, 1] = [batch size, sent len, 1]
+
         # print("attn_weights.size() = {}".format(attn_weights.size()))
         # attn_weights = [batch size, sent length]
 
         soft_attn_weights = F.softmax(attn_weights, 1)
+        # print("soft_attn_weights.size(): {}".format(soft_attn_weights.size()))
+        # soft_attn_weights = [batch size, sent len]
+
         new_hidden_state = torch.bmm(lstm_output.transpose(1, 2), soft_attn_weights.unsqueeze(2)).squeeze(2)
+        # lstm_output.transpose(1,2) = [batch size, hidden dim, sent len]
+        # soft_attn_weights.unsqueeze(2) = [batch size, sent len, 1]
+        # [batch size, hidden dim, sent len] * [batch size, sent len, 1] = [batch size, hidden dim, 1]
+        # print("lstm_output.transpose(1, 2).size(): {}".format(lstm_output.transpose(1, 2).size()))
         return new_hidden_state
 
     def forward(self, text, text_length):
