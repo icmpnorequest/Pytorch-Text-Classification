@@ -1,8 +1,8 @@
-# _*_ coding: utf-8 _*_
+# coding=utf-8
 """
 @author: Yantong Lai
-@date: 04/13/2020
-@descrption: Text classification with Attention mechanism in LSTM
+@date: 05/26/2020
+@descrption: Reimplementation of hierachical attention network
 """
 
 import torch
@@ -87,7 +87,7 @@ print("vars(train_data[0]) = {}\n".format(vars(train_data[0])))
 #          Build the Model         #
 ####################################
 class WordAttention(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, word_rnn_size, output_dim, word_rnn_layers, word_att_size, dropout):
+    def __init__(self, vocab_size, embedding_dim, word_rnn_size, word_rnn_layers, word_att_size, dropout):
         super(WordAttention, self).__init__()
 
         # 1. Embed
@@ -182,6 +182,115 @@ class WordAttention(nn.Module):
         # sentences = [batch size, 2 * word_rnn_size]
 
         return sentences, words_alphas
+
+
+class SentenceAttention(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, word_rnn_size, sentence_rnn_size, word_rnn_layers, sentence_rnn_layers,
+                 word_att_size, sentence_att_size, dropout):
+        """
+        :param vocab_size: number of words in the vocabulary of model
+        :param embedding_dim: size of word embeddings
+        :param word_rnn_size: size of bidirectional word-level RNN
+        :param sentence_rnn_size: size of bidirectional sentence-level RNN
+        :param word_rnn_layers: number of layers in word-level RNN
+        :param sentence_rnn_layers: number of layers in sentence-level RNN
+        :param word_att_size: size of word-level attention layer
+        :param sentence_att_size: size of sentence-level attention layer
+        :param dropout: dropout
+        """
+        super(SentenceAttention, self).__init__()
+
+        # 1. Word-level attention module
+        self.word_attention = WordAttention(vocab_size=vocab_size, embedding_dim=embedding_dim,
+                                            word_rnn_size=word_rnn_size, word_rnn_layers=word_rnn_layers,
+                                            word_att_size=word_att_size, dropout=dropout)
+
+        # 2. Bidirectional sentence-level RNN
+        self.sentence_rnn = nn.GRU(2 * word_rnn_size, sentence_rnn_size, num_layers=sentence_rnn_layers,
+                                   bidirectional=True, dropout=dropout, batch_first=True)
+
+        # 3. Sentence-level attention network
+        self.sentence_attention = nn.Linear(2 * sentence_rnn_size, sentence_att_size)
+
+        # 4. Sentence context vector to take dot-product
+        self.sentence_context_vector = nn.Linear(sentence_att_size, 1, bias=False)
+        # You could also do this with:
+        # self.sentence_context_vector = nn.Parameter(torch.FloatTensor(1, sentence_att_size))
+        # self.sentence_context_vector.data.uniform_(-0.1, 0.1)
+        # And then take the dot-product
+
+        # 5. Dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, documents, sentences_per_document, words_per_sentence):
+        """
+        :param documents: encoded document-level data, a tensor of dimensions (n_documents, sent_pad_len, word_pad_len)
+        :param sentences_per_document: document lengths, a tensor of dimensions (n_documents)
+        :param words_per_sentence: sentence lengths, a tensor of dimensions (n_documents, sent_pad_len)
+        :return: document embeddings, attention weights of words, attention weights of sentences
+        """
+        # 1. Re-arrange as sentences by removing sentence pads (DOCUMENTS -> SENTENCES)
+        packed_sentences = pack_padded_sequence(documents, lengths=sentences_per_document, batch_first=True,
+                                                enforce_sorted=False)
+        # packed_sentences = [n_sentences, word_pad_len]
+
+        # 2. Re-arrange sentence lengths in the same way (DOCUMENTS -> SENTENCES)
+        packed_words_per_sentence = pack_padded_sequence(words_per_sentence, lengths=sentences_per_document,
+                                                         batch_first=True, enforce_sorted=False)
+        # packed_words_per_sentence = [n_sentences]
+
+        # 3. Get word-level attention sentences and words_alphas
+        sentences, words_alphas = self.word_attention(packed_sentences.data, packed_words_per_sentence.data)
+        # sentences = [batch size, 2 * word_rnn_size], words_alphas = [batch size, max(sent len)]
+        sentences = self.dropout(sentences)
+
+        # 4. Apply the sentence-level RNN over the sentence embeddings
+        packed_sentences, _ = self.sentence_rnn(PackedSequence(data=sentences, batch_sizes=packed_sentences.batch_sizes,
+                                                               sorted_indices=packed_sentences.sorted_indices,
+                                                               unsorted_indices=packed_sentences.unsorted_indices))
+        # packed_sentences = [n_sentences, 2 * sentence_rnn_size]
+
+        # 5. Attention
+        att_s = self.sentence_attention(packed_sentences.data)
+        # att_s = [n_sentences, att_size]
+        att_s = torch.tanh(att_s)
+        att_s = self.sentence_context_vector(att_s).squeeze(1)
+        # att_s = [n_sentences]
+
+        # 6. Calculate sentence alphas
+        # 6.1 Get max value of att_s, scalar
+        max_value = att_s.max()
+        # 6.2 Calculate exponent
+        att_s = torch.exp(att_s - max_value)
+        # att_s = [n_sentences]
+        # 6.3 Re-arrange as documents by re-padding with 0s (SENTENCES -> DOCUMENTS)
+        att_s, _ = pad_packed_sequence(PackedSequence(data=att_s, batch_sizes=packed_sentences.batch_sizes,
+                                                      sorted_indices=packed_sentences.sorted_indices,
+                                                      unsorted_indices=packed_sentences.unsorted_indices),
+                                       batch_first=True)
+        # att_s = [n_documents, max(sentences_per_document)]
+        # 6.4 Calculate sentence alphas
+        sentence_alphas = att_s / torch.sum(att_s, dim=1, keepdim=True)
+        # sentence_alphas = [n_documents, max(sentences_per_document)]
+
+        # 7. Similarly re-arrange sentence-level RNN outputs as documents by re-padding with 0s (SENTENCES -> DOCUMENTS)
+        documents, _ = pad_packed_sequence(packed_sentences, batch_first=True)
+        # documents = [n_documents, max(sentences_per_document), 2 * sentence_rnn_size]
+
+        documents = documents * (sentence_alphas.unsqueeze(2))
+        documents = documents.sum(dim=1)
+        # documents = [n_documents, 2 * sentence_rnn_size]
+
+        # Also re-arrange word_alphas (SENTENCES -> DOCUMENTS)
+        word_alphas, _ = pad_packed_sequence(PackedSequence(data=words_alphas,
+                                                            batch_sizes=packed_sentences.batch_sizes,
+                                                            sorted_indices=packed_sentences.sorted_indices,
+                                                            unsorted_indices=packed_sentences.unsorted_indices),
+                                             batch_first=True)
+        # word_alphas = [n_documents, max(sentences_per_document), max(words_per_sentence)]
+
+        return documents, word_alphas, sentence_alphas
+
 
 '''
 wordAttention = WordAttention(vocab_size=VOCAB_SIZE, embedding_dim=EMBEDDING_DIM, word_rnn_size=WORD_RNN_SIZE,
