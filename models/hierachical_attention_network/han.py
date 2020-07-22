@@ -9,6 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class WordEncoder(nn.Module):
     """
@@ -73,15 +76,19 @@ class Attention(nn.Module):
         # input = [30, 64, 100]
 
         batch_size = input.size()[1]
-        weighted_sum = torch.zeros(batch_size, self.input_size)
+        weighted_sum = torch.zeros(batch_size, self.input_size).to(DEVICE)
         # Word. weighted_sum = [64, 100]
         # Sent. weighted_sum = [64, 160]
 
         for alpha, h in zip(output, input):
             # alpha = [64]
             # h = [64, 100]
+            alpha = alpha.to(DEVICE)
+            h = h.to(DEVICE)
+
             alpha = alpha.unsqueeze(1).expand_as(h)
-            weighted_sum += alpha * h
+            # weighted_sum += alpha * h
+            weighted_sum = torch.add(weighted_sum, alpha * h)
         return weighted_sum
 
 
@@ -127,7 +134,6 @@ class HierachicalAttentionNetwork(nn.Module):
     def forward(self, input):
         # 1. Format input
         # input = [64, 2, 30]
-        print("1. input.size(): {}".format(input.size()))
         input = input.permute(1, 2, 0)
         # input = [2, 30, 64]
 
